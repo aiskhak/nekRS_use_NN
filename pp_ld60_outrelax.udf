@@ -1,0 +1,222 @@
+// nekRS User Defined File
+#include <math.h>
+#include "udf.hpp"
+#include "plugins/velRecycling.hpp"
+#include "plugins/avg.hpp"
+#include "casedata.h"
+
+// added for libtorch
+#include <torch/script.h>
+#include <iostream>
+#include <memory>
+
+// added for output
+#include <string>
+#include <fstream> 
+
+static occa::kernel fillFUKernel; 
+static occa::kernel cliptKernel;
+
+static int nsteps = -2;
+static int outXYZ = 1; 
+static int FP64 = 1;
+static int Nscalar = 1;
+static occa::memory o_null;
+
+void userf(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_FU)
+{
+   mesh_t* mesh = nrs->meshV;
+   fillFUKernel(mesh->Nlocal, nrs->fieldOffset, nrs->cds->o_S, nrs->o_FU);
+}
+
+// replace viscosity by effective viscosity
+void uservp(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_S,
+            occa::memory o_UProp, occa::memory o_SProp)
+{
+
+  // calculate inputs in Fortran subroutine
+  nek::userchk();
+  
+  // mesh
+  mesh_t * meshV = nrs->meshV;
+
+  // inputs & outputs dimensions
+  int ni_nut = 4;
+  int ni_alt = 5;  
+
+  // batch size - number of points in arrays
+  int batch = meshV->Nlocal;
+
+  // access pointers from userchk() -------------
+  dfloat *i1_  = (dfloat *) nek::scPtr(1);
+  dfloat i1[batch];
+  std::memcpy(i1, i1_, sizeof(dfloat)*batch);
+  //
+  dfloat *i2_  = (dfloat *) nek::scPtr(2);
+  dfloat i2[batch];
+  std::memcpy(i2, i2_, sizeof(dfloat)*batch);
+  //
+  dfloat *dtdy_= (dfloat *) nek::scPtr(3);
+  dfloat dtdy[batch];
+  std::memcpy(dtdy, dtdy_, sizeof(dfloat)*batch);
+  //  
+  dfloat *dtdz_= (dfloat *) nek::scPtr(4);
+  dfloat dtdz[batch];
+  std::memcpy(dtdz, dtdz_, sizeof(dfloat)*batch);
+  //
+  dfloat *yw_  = (dfloat *) nek::scPtr(5);
+  dfloat yw[batch];
+  std::memcpy(yw,  yw_,  sizeof(dfloat)*batch);
+  //
+  dfloat *Re_  = (dfloat *) nek::scPtr(6);
+  dfloat Re[batch];
+  std::memcpy(Re, Re_, sizeof(dfloat)*batch);
+  
+  dfloat *z_mult_  = (dfloat *) nek::scPtr(7);
+  dfloat z_mult[batch];
+  std::memcpy(z_mult, z_mult_, sizeof(dfloat)*batch); 
+  // --------------------------------------------
+
+  // concatenate inputs in one tensor {{batch_0}, {batch_1}, ..., {batch_n}} -----------------------------
+  torch::Tensor i1_ten     = torch::from_blob(i1,     {batch,1}, at::kDouble);
+  torch::Tensor i2_ten     = torch::from_blob(i2,     {batch,1}, at::kDouble);
+  torch::Tensor dtdy_ten   = torch::from_blob(dtdy,   {batch,1}, at::kDouble);
+  torch::Tensor dtdz_ten   = torch::from_blob(dtdz,   {batch,1}, at::kDouble);  
+  torch::Tensor yw_ten     = torch::from_blob(yw,     {batch,1}, at::kDouble);
+  torch::Tensor Re_ten     = torch::from_blob(Re,     {batch,1}, at::kDouble);
+  torch::Tensor z_mult_ten = torch::from_blob(z_mult, {batch,1}, at::kDouble);  
+  // 
+  dfloat i_min_nut = -925.3632619838512;
+  dfloat i_max_nut =  925.3632619838512;
+  torch::Tensor inp_ten_nut = torch::cat({2.0*(i1_ten - i_min_nut)/(i_max_nut - i_min_nut) - 1.0, 
+                                          2.0*(i2_ten - i_min_nut)/(i_max_nut - i_min_nut) - 1.0, 
+										  yw_ten, Re_ten}, 1);
+  //
+  dfloat i_min_alt = -288.17656455460985;
+  dfloat i_max_alt =  288.17656455460985;
+  dfloat dt_min_alt = -1.9937075510112892;
+  dfloat dt_max_alt =  0.7330944109528543; 
+  torch::Tensor inp_ten_alt = torch::cat({2.0*(i1_ten - i_min_alt)/(i_max_alt - i_min_alt) - 1.0, 
+                                          2.0*(i2_ten - i_min_alt)/(i_max_alt - i_min_alt) - 1.0, 
+										  2.0*(dtdy_ten - dt_min_alt)/(dt_max_alt - dt_min_alt) - 1.0, 
+										  2.0*(dtdz_ten - dt_min_alt)/(dt_max_alt - dt_min_alt) - 1.0, 
+										  yw_ten}, 1);  
+  // -----------------------------------------------------------------------------------------------------
+ 
+  // cast inputs to vector (needed for libtorch) -------------------------------------------------------
+  std::vector<torch::jit::IValue> inp_vec_nut;
+  std::vector<torch::jit::IValue> inp_vec_alt;
+  inp_vec_nut.push_back(torch::from_blob(inp_ten_nut.data_ptr<dfloat>(), {batch, ni_nut}, at::kDouble));
+  inp_vec_alt.push_back(torch::from_blob(inp_ten_alt.data_ptr<dfloat>(), {batch, ni_alt}, at::kDouble));
+  // ---------------------------------------------------------------------------------------------------
+
+  // deserialize and load scriptmodule ----------
+  torch::jit::script::Module module_nut;
+  torch::jit::script::Module module_alt;  
+  module_nut = torch::jit::load("nn/net_nut.pt");
+  module_alt = torch::jit::load("nn/net_alt.pt");
+  // --------------------------------------------
+
+  // make predictions ----------------------------------------------------------------------------
+  torch::Tensor out_ten_nut = module_nut.forward(inp_vec_nut).toTensor();
+  torch::Tensor out_ten_alt = module_alt.forward(inp_vec_alt).toTensor();
+  out_ten_nut = out_ten_nut*(20.330808638044584-2.7826111832757506e-05) + 2.7826111832757506e-05;
+  out_ten_alt = out_ten_alt*(0.04844020449798578-0.00042341118638943785) + 0.00042341118638943785;
+  out_ten_alt = torch::mul(out_ten_alt, z_mult_ten); // remove garbage before z=5
+  // ---------------------------------------------------------------------------------------------
+  
+  // get viscosity and conductivity ---------------------
+  dfloat mu, con;
+  platform_t* platform = platform_t::getInstance();
+  platform->options.getArgs("VISCOSITY", mu);
+  platform->options.getArgs("SCALAR00 DIFFUSIVITY", con);
+  // ----------------------------------------------------
+
+  // calculate effective viscosity and conductivity ---------------------------
+  torch::Tensor mu_ten  = torch::full({batch,1}, mu,  at::kDouble);
+  torch::Tensor con_ten = torch::full({batch,1}, con, at::kDouble);
+  torch::Tensor mu_e_ten  = torch::addcmul(mu_ten,  out_ten_nut, yw_ten, mu);
+  torch::Tensor con_e_ten = torch::addcmul(con_ten, out_ten_alt, yw_ten, con);
+  // --------------------------------------------------------------------------
+
+  // replace the properties by effective values ------------------------
+  occa::memory o_mu = o_UProp.slice(0);
+  o_mu.copyFrom(mu_e_ten.data_ptr<dfloat>(), batch*sizeof(dfloat));
+  occa::memory o_con = o_SProp.slice(0);
+  o_con.copyFrom(con_e_ten.data_ptr<dfloat>(), batch*sizeof(dfloat));
+  
+  // output fields
+  nsteps += 1;
+  if (nsteps % 50 == 0 and nsteps != 0)
+  {
+    occa::memory o_i1 = platform->device.malloc(batch, sizeof(dfloat));
+    o_i1.copyFrom(i1, batch*sizeof(dfloat));
+    
+    occa::memory o_i2 = platform->device.malloc(batch, sizeof(dfloat));
+    o_i2.copyFrom(i2, batch*sizeof(dfloat));
+
+    occa::memory o_dtdy = platform->device.malloc(batch, sizeof(dfloat));
+    o_dtdy.copyFrom(dtdy, batch*sizeof(dfloat));
+
+    occa::memory o_dtdz = platform->device.malloc(batch, sizeof(dfloat));
+    o_dtdz.copyFrom(dtdz, batch*sizeof(dfloat));
+    
+    writeFld("pro", time, outXYZ, FP64, &o_null, &o_mu,   &o_con,  Nscalar);
+    writeFld("inv", time, outXYZ, FP64, &o_null, &o_i1,   &o_i2,   Nscalar);
+    writeFld("dtd", time, outXYZ, FP64, &o_null, &o_dtdy, &o_dtdz, Nscalar);
+  }
+}
+
+/* UDF Functions */     
+void clipt(nrs_t *nrs) // clipping
+{
+   mesh_t *meshV = nrs->meshV;
+   cds_t* cds = nrs->cds;
+   cliptKernel(meshV->Nelements, cds->o_S); 
+} 
+                                                 
+
+void UDF_LoadKernels(nrs_t *nrs)
+{
+   velRecycling::buildKernel(nrs);
+   avg::buildKernel(nrs);
+   fillFUKernel = udfBuildKernel(nrs, "fillFU");
+   cliptKernel = udfBuildKernel(nrs, "cliptOKL"); // clipping
+}
+
+void UDF_Setup(nrs_t *nrs)
+{
+   udf.uEqnSource = &userf;
+   udf.properties = &uservp;  // do NN stuff here
+
+   // setup scratch space
+   platform_t* platform = platform_t::getInstance();
+   nrs->o_usrwrk = platform->device.malloc(nrs->NVfields*nrs->fieldOffset,  sizeof(dfloat));
+
+   // recycling
+   const dfloat wbar  = 1.0;
+   const int bID      = 1; 
+   dfloat zRecycLayer = (1.0/12.0)*ZLENGTH;
+   const hlong offset = NELSLAB * round(NSLABS * zRecycLayer/ZLENGTH); 
+   velRecycling::setup(nrs, nrs->o_usrwrk, offset, bID, wbar);
+
+   avg::setup(nrs);
+}
+
+void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
+{
+   mesh_t *mesh = nrs->meshV;
+   velRecycling::copy();
+   //  avg::run(time);
+   nek::ocopyToNek(time, tstep);
+   //nek::userchk(); 
+   //clipt(nrs);
+
+   if (nrs->isOutputStep) {
+      occa::memory o_UZ = nrs->o_U + 2*nrs->fieldOffset * sizeof(dfloat);
+      const dfloat ubar = platform->linAlg->innerProd(mesh->Nlocal, o_UZ, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+      if (platform->comm.mpiRank == 0) printf(" uBulk: %g\n", ubar);
+
+   //    avg::outfld();
+  }
+}
